@@ -1,0 +1,148 @@
+package transaction
+
+import (
+	"bytes"
+	"context"
+
+	"github.com/libsv/go-bk/bec"
+	"github.com/libsv/go-bk/crypto"
+	"github.com/libsv/go-bt/v2"
+	"github.com/libsv/go-bt/v2/bscript"
+	"github.com/libsv/go-bt/v2/sighash"
+	btunlocker "github.com/libsv/go-bt/v2/unlocker"
+	"github.com/murray-distributed-technologies/go-hashchain/script"
+)
+
+func CreateTokenKeysTransaction(utxo *bt.UTXO, privKey *bec.PrivateKey, address, changeAddress string, satoshis uint64) (string, error) {
+	var err error
+	tx := bt.NewTx()
+
+	if err = tx.FromUTXOs(utxo); err != nil {
+		return "", err
+	}
+	tx.AddP2PKHOutputFromAddress(address, satoshis)
+
+	if utxo.LockingScript.IsP2PKH() {
+		fq := bt.NewFeeQuote()
+		if err = tx.ChangeToAddress(changeAddress, fq); err != nil {
+			return "", err
+		}
+	}
+
+	unlocker := Getter{PrivateKey: privKey}
+
+	// sign input
+
+	if err = tx.FillAllInputs(context.Background(), &unlocker); err != nil {
+		return "", err
+	}
+	return tx.String(), nil
+
+}
+
+func CreateHashTransaction(utxo *bt.UTXO, privKey *bec.PrivateKey, token, hash []byte, address, changeAddress string, satoshis uint64) (string, error) {
+	var err error
+	tx := bt.NewTx()
+
+	if err = tx.FromUTXOs(utxo); err != nil {
+		return "", err
+	}
+	if tx, err = AddOutput(tx, address, hash, satoshis); err != nil {
+		return "", err
+	}
+
+	if utxo.LockingScript.IsP2PKH() {
+		fq := bt.NewFeeQuote()
+		if err = tx.ChangeToAddress(changeAddress, fq); err != nil {
+			return "", err
+		}
+	}
+	if !utxo.LockingScript.IsP2PKH() {
+		lockingScript, err := bscript.NewP2PKHFromAddress(changeAddress)
+		if err != nil {
+			return "", err
+		}
+		// need to fix this in go-bt library... just estimating fee for now
+		amount := (utxo.Satoshis - satoshis - 500)
+		changeOutput := bt.Output{
+			Satoshis:      amount,
+			LockingScript: lockingScript,
+		}
+		tx.AddOutput(&changeOutput)
+	}
+
+	unlocker := Getter{PrivateKey: privKey, Token: token}
+
+	// sign input
+
+	if err = tx.FillAllInputs(context.Background(), &unlocker); err != nil {
+		return "", err
+	}
+	return tx.String(), nil
+
+}
+
+func AddOutput(tx *bt.Tx, address string, hash []byte, satoshis uint64) (*bt.Tx, error) {
+	lockingScript, err := script.NewLockingScript(hash, address)
+	if err != nil {
+		return nil, err
+	}
+
+	output := bt.Output{
+		Satoshis:      satoshis,
+		LockingScript: lockingScript,
+	}
+	tx.AddOutput(&output)
+	return tx, nil
+}
+
+type Getter struct {
+	PrivateKey *bec.PrivateKey
+	Token      []byte
+}
+
+func (g *Getter) Unlocker(ctx context.Context, lockingScript *bscript.Script) (bt.Unlocker, error) {
+	if lockingScript.IsP2PKH() {
+		return &btunlocker.Simple{PrivateKey: g.PrivateKey}, nil
+	}
+	return &UnlockTx{PrivateKey: g.PrivateKey, Token: g.Token}, nil
+}
+
+type UnlockTx struct {
+	PrivateKey *bec.PrivateKey
+	Token      []byte
+}
+
+func (u *UnlockTx) UnlockingScript(ctx context.Context, tx *bt.Tx, params bt.UnlockerParams) (*bscript.Script, error) {
+	if params.SigHashFlags == 0 {
+		params.SigHashFlags = sighash.AllForkID
+	}
+
+	preimage, err := tx.CalcInputPreimage(params.InputIdx, params.SigHashFlags)
+	if err != nil {
+		return nil, err
+	}
+
+	var defaultHex = []byte{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	var sh []byte
+	sh = crypto.Sha256d(preimage)
+
+	if bytes.Equal(defaultHex, preimage) {
+		sh = preimage
+	}
+	sig, err := u.PrivateKey.Sign(sh)
+	if err != nil {
+		return nil, err
+	}
+
+	pubKey := u.PrivateKey.PubKey().SerialiseCompressed()
+
+	signature := sig.Serialise()
+
+	uscript, err := script.NewUnlockingScript(pubKey, signature, u.Token, params.SigHashFlags)
+	if err != nil {
+		return nil, err
+	}
+
+	return uscript, nil
+}
